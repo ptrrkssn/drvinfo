@@ -1,0 +1,1511 @@
+#!/usr/local/bin/perl
+#
+# Copyright (c) 2023, Peter Eriksson <pen@lysator.liu.se>
+# All rights reserved.
+# 
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+# 
+# * Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+# 
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+# 
+# * Neither the name of the copyright holder nor the names of its
+#   contributors may be used to endorse or promote products derived from
+#   this software without specific prior written permission.
+# 
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# 
+
+use strict;
+use warnings;
+
+use utf8;
+binmode STDIN,  ':utf8';
+binmode STDOUT, ':utf8';
+binmode STDERR, ':utf8';
+
+# use Sys::Syslog;
+use Data::Dumper;
+
+# use Config::Tiny;
+use Getopt::Std;
+# use MIME::Base64;
+
+
+my $version = '1.0.21';
+my $author = 'Peter Eriksson <pen@lysator.liu.se>';
+
+my $drives_by_dev;
+my $drives_by_id;
+
+my $gpart_dev_by_name;
+my $gpart_name_by_dev;
+
+my $gmirror_by_provider;
+my $gmirror_by_consumer;
+
+$ENV{LC_NUMERIC}='C';
+
+
+my @empty_drive_bays;
+my @seslist;
+
+
+my $f_verbose = 0;
+my $f_debug = 0;
+my $f_header = 1;
+
+my $f_view = 'default';
+my $f_sort = 'dev';
+
+my %options=();
+getopts("hvVdHeaupS:", \%options);
+
+if (defined $options{h}) {
+    print "Usage:\n";
+    print "  $0 [<options>] [<device-list>]\n\n";
+    print "Options:\n";
+    print "  -h            Display this information\n";
+    print "  -v            Be verbose\n";
+    print "  -V            Be very verbose\n";
+    print "  -d            Debug mode\n";
+    print "  -H            Skip header\n";
+    print "  -S <how>      Sort by (dev,bay,serial)\n";
+    print "  -e            List empty drive bays\n";
+    print "  -a            List all drives\n";
+    print "  -u            List unallocated drives\n";
+    print "  -p            List problematic drives\n";
+    exit 0;
+}
+
+my @sel_drives = @ARGV;
+
+$f_verbose     = 1 if defined $options{v};
+$f_verbose     = 2 if defined $options{V};
+$f_debug       = 1 if defined $options{d};
+$f_header      = 0 if defined $options{H};
+
+$f_view = 'unallocated' if defined $options{u};
+$f_view = 'problems'    if defined $options{p};
+$f_view = 'empty'       if defined $options{e};
+$f_view = 'all'         if defined $options{a};
+
+$f_sort = $options{S} if defined $options{S};
+
+if ($f_verbose) {
+    print "[1m" if -t STDOUT;
+    print "[DRVINFO v$version - Copyright (c) 2023 $author]";
+    print "[0m" if -t STDOUT;
+    print "\n\n";
+}
+
+sub set_value {
+    my ($d, $k, $v) = @_;
+
+    return unless defined $v;
+
+    if (!defined $d->{$k}) {
+	$d->{$k} = $v;
+    } else {
+	my @kv = split(/,/, $d->{$k});
+	$d->{$k} .= ','.$v unless in_list($v, @kv);
+    }
+    
+    return $v;
+}
+
+
+sub in_list {
+    my $v = shift;
+
+    while (0 < @_) {
+	my $x = shift;
+	return 1 if "$v" eq "$x";
+    }
+
+    return 0;
+}
+
+
+my $smpphylist_by_dev;
+my $smpphylist_by_addr;
+
+
+## camcontrol smpphylist ses0 -q
+#  0  0x5000cca2519c5c95   <HGST HUH721010AL4200 LS21>       (pass0,da0)
+#  1  0x5000cca251b87b1d   <HGST HUH721010AL4200 LS21>       (pass1,da1)
+#  2  0x5000cca251b89665   <HGST HUH721010AL4200 LS21>       (pass2,da2)
+#  3  0x5000cca251b5a8f9   <HGST HUH721010AL4200 LS21>       (pass3,da3)
+#  4  0x58ce38ee20bf026a   <TOSHIBA KPM5XMUG400G B026>       (pass4,da4)
+#  5  0x58ce38ee20d16fde   <TOSHIBA KPM5XVUG960G B026>       (pass5,da5)
+# 12  0x500056b33da428cc   <ATA SSDSC2BB120G7R DL43>         (pass6,da6)
+# 13  0x500056b33da428cd   <ATA SSDSC2BB120G7R DL43>         (pass7,da7)
+# 14  0x500056b33da428ce   <ATA SSDSC2BB120G7R DL43>         (pass8,da8)
+# 15  0x500056b33da428cf   <ATA SSDSC2BB120G7R DL43>         (pass9,da9)
+# 28  0x500056b33da428fd   <DP BP13G+EXP 3.35>               (pass10,ses0)
+sub load_camcontrol_smpphylist {
+    foreach my $ses (@_) {
+	open(FH, "camcontrol smpphylist ses$ses -q 2>/dev/null |") || next;
+	while (<FH>) {
+	    chomp($_);
+	    my $line = $_;
+	    
+	    if ($line =~ /^\s*(\d+)\s+0x([0-9a-f]+)\s+<([^>]+)>\s+\(([^,]+),([^\)]+)\)/) {
+		my $d;
+		$d->{phy} = $1;
+		$d->{addr} = $2;
+		$d->{model} = $3;
+		$d->{pass} = $4;
+		$d->{dev} = $5;
+		
+		$smpphylist_by_dev->{$d->{dev}} = $d;
+		$smpphylist_by_addr->{$d->{addr}} = $d;
+	    }
+	}
+	close(FH);
+    }
+}
+
+
+
+## mprutil show devices
+# B____T    SAS Address      Handle  Parent    Device        Speed Enc  Slot  Wdt
+#           5947b0b0d430bd00 0009    0001      SEP Target          0001 10    0
+# 00   00   4433221106000000 000a    0001      SATA Target   6.0   0001 00    1
+# 00   01   4433221107000000 000b    0002      SATA Target   6.0   0001 01    1
+
+# # mprutil show devices
+# B____T    SAS Address      Handle  Parent    Device        Speed Enc  Slot  Wdt
+#           500056b30b1267ff 0009    0001      SMP Target    12    0002 00    8
+# 00   08   5000c500a0430b0d 000a    0009      SAS Target    12    0002 00    1
+# 00   09   5000c500a040f5ad 000b    0009      SAS Target    12    0002 01    1
+# 00   34   500056b30b1267da 0022    0009      SATA Target   6.0   0002 26    1
+# 00   40   500056b30b1267fd 0028    0009      SEP Target    12    0002 32    1
+
+
+## mpsutil show devices
+# B____T    SAS Address      Handle  Parent    Device        Speed Enc  Slot  Wdt
+# 00   00   4433221100000000 0009    0001      SATA Target   3.0   0001 03    1
+# 00   08   4433221106000000 000a    0002      SATA Target   6.0   0001 05    1
+# 00   10   4433221101000000 000b    0003      SATA Target   3.0   0001 02    1
+# 00   04   4433221102000000 000c    0004      SATA Target   3.0   0001 01    1
+# 00   05   4433221103000000 000d    0005      SATA Target   3.0   0001 00    1
+# 00   06   4433221104000000 000e    0006      SATA Target   3.0   0001 07    1
+# 00   07   4433221105000000 000f    0007      SATA Target   3.0   0001 06    1
+# 00   09   4433221107000000 0010    0008      SATA Target   6.0   0001 04    1
+
+my $mprs_by_addr;
+
+sub load_mprsutil {
+    my $cmd = shift;
+    
+    open(FH, "${cmd} show devices 2>/dev/null |");
+    while (<FH>) {
+	chomp($_);
+	my $line = $_;
+	
+	if ($line =~ /^(\d+)\s+(\d+)\s+([\da-f]+)\s+([\da-f]+)\s+(\d+)\s+(\S+) Target\s+([\d\.]+)\s+(\d+)\s+(\d+)\s+(\d+)$/) {
+	    my $d;
+
+	    my $id = "$1:$2";
+	    $d->{id} = $id;
+	    
+	    set_value($d, 'bus', $1);
+	    set_value($d, 'target', $2);
+	    set_value($d, 'address', $3);
+	    set_value($d, 'handle', $4);
+	    set_value($d, 'parent', 0+$5);
+	    set_value($d, 'type', $6);
+	    set_value($d, 'speed', $7);
+	    set_value($d, 'unit', (0+$8));
+	    set_value($d, 'bay', (0+$9));
+	    set_value($d, 'wdt', $10);
+
+	    $mprs_by_addr->{$3} = $d;
+	}
+    }
+    close(FH);
+}
+
+
+
+# ses3: <HPE D6020 2.74>; ID: 5001438041bb0000
+# Desc     Dev     Model                     Ident                Size/Status
+# {"Name":"Drive bay"} -       -                         -                    OK
+# {"Name":"DriveBay35"}    da101   HP MB012000JWDFD          5PGLBRRE             12T
+# {"Name":"DriveBay35"}    da101   HP MB012000JWDFD          5PGLBRRE             12T, LED=locate
+#...
+# ses4: <AHCI SGPIO Enclosure 2.00>; ID: 3061686369656d30
+# Desc     Dev     Model                     Ident                Size/Status
+# Slot 00  -       -                         -                    Unknown
+# Slot 02  ada0    MK000240GWEZF             17491BE2C8F3         240G
+# Drive Slot 0 da0     HGST HUH721010AL4200      7PJSZTNC             Unknown
+# Drive Slot 1 da1     HGST HUH721010AL4200      7PK8G64C             Unknown
+# Drive Slot 2 da2     HGST HUH721010AL4200      7PK8J0GG             Unknown
+# Drive Slot 3 da3     HGST HUH721010AL4200      7PK6X38C             Unknown
+# Drive Slot 12 da12    ATA SSDSC2BB960G7R        PHDV715000MG960FGN   Unknown
+# Drive Slot 13 da13    ATA SSDSC2BB960G7R        PHDV715000MQ960FGN   Unknown
+# Drive Slot 14 da14    ATA INTEL SSDSC2BA40      BTHV7146043U400NGN   Unknown
+# Drive Slot 15 da15    ATA INTEL SSDSC2BA40      BTHV71460441400NGN   Unknown
+# Drive Slot 16 da16    HGST HUH721010AL4200      7PJHUT6C             Unknown
+# Drive Slot 17 da17    HGST HUH721010AL4200      7PK6HZ3C             Unknown
+
+sub load_sesutil_show {
+    open(FH, 'sesutil show 2>/dev/null |');
+
+    my $ses_unit;
+    my $ses_model;
+    
+    while (<FH>) {
+	chomp($_);
+
+	my $line = $_;
+	
+	my $bay;
+	my $dev;
+	my $vendor;
+	my $model;
+	my $serial;
+	my $size;
+
+	if ($line =~ /^ses(\d+): <([^>]+)>/) {
+	    $ses_unit = $1;
+	    $ses_model = $2;
+	    push @seslist, $1;
+	} elsif ($line =~ /^\{"Name":"DriveBay(\d+)"\}\s+-\s+-\s+-\s+(\S.*)$/) {
+	    $bay = $1;
+	    $size = $2;
+	} elsif ($line =~ /^\{"Name":"DriveBay(\d+)"\}\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S.*)$/) {
+	    $bay = $1;
+	    $dev = $2;
+	    $vendor = $3;
+	    $model = $4;
+	    $serial = $5;
+	    $size = $6;
+	} elsif ($line =~ /^Slot\s+(\d+)\s+-\s+-\s+-\s+(\S.*)$/) {
+	    $bay = $1;
+	    $size = $2;
+	} elsif ($line =~ /^Slot\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S.*)$/) {
+	    $bay = $1;
+	    $dev = $2;
+	    $model = $3;
+	    $serial = $4;
+	    $size = $5;
+	} elsif ($line =~ /^Drive Slot\s+(\d+)\s+-\s+-\s+-\s+(\S.*)$/) {
+	    $bay = $1;
+	    $size = $2;
+	} elsif ($line =~ /^Drive Slot\s+(\d+)\s+([a-z]+\d+)\s\s+(\S+ \S+ \S+)\s\s+(\S+)\s+(\S.*)$/ or
+		 $line =~ /^Drive Slot\s+(\d+)\s+([a-z]+\d+)\s\s+(\S+ \S+)\s\s+(\S+)\s+(\S.*)$/ or
+		 $line =~ /^Drive Slot\s+(\d+)\s+([a-z]+\d+)\s\s+(\S+)\s\s+(\S+)\s+(\S.*)$/) {
+	    $bay = $1;
+	    $dev = $2;
+	    $model = $3;
+	    $serial = $4;
+	    $size = $5;
+	}
+	    
+	next unless defined $bay;
+
+	if (defined $model) {
+	    if ($model =~ /^(\S+)\s+(\S+)\s+(\S+)$/) {
+		$vendor = $2;
+		$model = $3;
+	    } elsif ($model =~ /^(\S+)\s+(\S+)$/) {
+		$vendor = $1;
+		$model = $2;
+	    }
+	}
+
+	my $ses_info;
+	if (defined $size and $size =~ /^([^,]+),\s*(\S.*)$/) {
+	    $size = $1;
+	    $ses_info = $2;
+	}
+	undef $size unless $size =~ /^\d+[A-Z]$/;
+		
+	if (defined $bay) {
+
+	    if (!defined $dev) {
+		my $d;
+		$d->{bay} = 0+$bay;
+		set_value($d, 'size', $size);
+		set_value($d, 'ses_info', $ses_info);
+		set_value($d, 'ses_unit', $ses_unit);
+		set_value($d, 'ses_model', $ses_model);
+		my $id = "_pseudo_".ps($ses_unit).':'.ps($bay);
+		$drives_by_id->{$id} = $d;
+		push @empty_drive_bays, $d;
+	    } else {
+		next if defined $dev and 0 < @sel_drives and !in_list($dev, @sel_drives);
+		
+		my $d = $drives_by_id->{$serial};
+		$d->{dev} = $dev;
+		
+		set_value($d, 'bay', 0+$bay);
+		set_value($d, 'vendor', $vendor);
+		set_value($d, 'model', $model);
+		set_value($d, 'serial', $serial);
+		set_value($d, 'size', $size);
+		set_value($d, 'ses_info', $ses_info);
+		set_value($d, 'ses_unit', $ses_unit);
+		set_value($d, 'ses_model', $ses_model);;
+		
+		$drives_by_id->{$serial} = $d;
+		$drives_by_dev->{$dev} = $d;
+	    }
+	}
+    }
+    close(FH);
+}
+
+
+
+# gmirror list
+# Geom name: gm0
+# State: COMPLETE
+# Components: 2
+# Balance: load
+# Slice: 4096
+# Flags: NONE
+# GenID: 0
+# SyncID: 1
+# ID: 3061659259
+# Type: AUTOMATIC
+# Providers:
+# 1. Name: mirror/gm0
+#    Mediasize: 400088456704 (373G)
+#    Sectorsize: 512
+#    Stripesize: 4096
+#    Stripeoffset: 0
+#    Mode: r0w0e0
+# Consumers:
+# 1. Name: da4
+#    Mediasize: 400088457216 (373G)
+#    Sectorsize: 512
+#    Stripesize: 4096
+#    Stripeoffset: 0
+#    Mode: r1w1e1
+#    State: ACTIVE
+#    Priority: 0
+#    Flags: (null)
+#    GenID: 0
+#    SyncID: 1
+#    ID: 3464942099
+
+sub load_gmirror_list {
+    my @devlist;
+
+    my $gname;
+    my $pname;
+    my $dname;
+    my $state = 0;
+    
+    open(FH, "gmirror list 2>/dev/null |");
+    while (<FH>) {
+	chomp($_);
+
+	if ($_ =~ /^Geom name:\s+(\S+)$/) {
+	    $gname = $1;
+	    undef $pname;
+	    undef $dname;
+	    $state = 1;
+	    next;
+	} elsif ($_ =~ /^Providers:$/) {
+	    $state = 2;
+	    next;
+	} elsif ($_ =~ /^Consumers:$/) {
+	    $state = 3;
+	    next;
+	}
+	
+	if ($state == 2) {
+	    if ($_ =~ /^\d+\.\s*Name:\s+(\S+)$/) {
+		$pname = $1;
+		
+		my $m;
+		$m->{gname} = $gname;
+		$m->{pname} = $pname;
+
+		$gmirror_by_provider->{$pname} = $m;
+	    }
+	}
+	
+	if ($state == 3) {
+	    if ($_ =~ /^\d+\.\s*Name:\s+(\S+)$/) {
+		$dname = $1;
+
+		my $m = $gmirror_by_provider->{$pname};
+		if (defined $m->{dname}) {
+		    $m->{dname} .= ','.$dname;
+		} else {
+		    $m->{dname} = $dname;
+		}
+		
+		$gmirror_by_consumer->{$dname} = $m;
+	    }
+	}
+    }
+    close(FH);
+}
+
+
+
+# Name: da7p4
+#    Mediasize: 117884059648 (110G)
+#    Sectorsize: 512
+#    Stripesize: 4096
+#    Stripeoffset: 0
+#    Mode: r1w1e2
+#    efimedia: HD(4,GPT,d02f3a32-a827-11e7-9c21-246e9671f264,0x401000,0xdb93800)
+#    rawuuid: d02f3a32-a827-11e7-9c21-246e9671f264
+#    rawtype: 516e7cba-6ecf-11d6-8ff8-00022d09712b
+#    label: zfs1
+
+sub load_gpart_list {
+    my $gname;
+    my $dname;
+    my $label;
+    my $state = 0;
+    
+    open(FH, "gpart list ".join(' ', @sel_drives)." 2>/dev/null |");
+    while (<FH>) {
+	chomp($_);
+
+	
+	if ($_ =~ /^Geom name:\s+(\S+)$/) {
+	    $gname = $1;
+	    undef $dname;
+	    undef $label;
+	    $state = 1;
+	    next;
+	    
+	} elsif ($_ =~ /^Providers:$/) {
+	    $state = 2;
+	    next;
+	    
+	} elsif ($_ =~ /^Consumers:$/) {
+	    $state = 3;
+	    next;
+	}
+
+
+	if ($state == 2) {
+	    if ($_ =~ /^\s+label:\s+(\S+)$/) {
+		$label = $1;
+		$gpart_name_by_dev->{$label} = $gname;
+		$gpart_dev_by_name->{$label} = $dname;
+	    } elsif ($_ =~ /^\d+\.\s*Name:\s+(\S+)p\d+$/ or
+		     $_ =~ /^\d+\.\s*Name:\s+(\S+)$/) {
+		$dname = $1;
+		$gpart_name_by_dev->{$dname} = $gname;
+		$gpart_dev_by_name->{$gname} = $gname;
+	    }
+	}
+    }
+    close(FH);
+}
+
+#  nvmecontrol logpage -p2 nvme0
+# SMART/Health Information Log
+# ============================
+# Critical Warning State:         0x00
+#  Available spare:               0
+#  Temperature:                   0
+#  Device reliability:            0
+#  Read only:                     0
+#  Volatile memory backup:        0
+# Temperature:                    294 K, 20.85 C, 69.53 F
+
+sub load_nvmecontrol_logpage {
+    foreach my $dev (@_) {
+	my $smart;
+	my $temp;
+	
+	open(FH, "nvmecontrol logpage -p2 $dev |");
+
+	while (<FH>) {
+	    chomp($_);
+
+	    if ($_ =~ /^Critical Warning State:\s+(\S+)$/) {
+		$smart = $1;
+	    } elsif ($_ =~ /^Temperature:\s+\d+ K, ([\d.]+) C,/) {
+		$temp = sprintf "%d C", $1;
+	    }
+	}
+
+	close(FH);
+
+	if (defined $smart and defined $temp) {
+	    my $d = $drives_by_dev->{$dev};
+	    set_value($d, 'smart', $smart);
+	    set_value($d, 'temp', $temp);
+	}
+    }
+}
+
+
+
+# root@filur00:/usr/home/Lpeter86 # nvmecontrol identify nvme0
+# Controller Capabilities/Features
+# ================================
+# Vendor ID:                   8086
+# Subsystem Vendor ID:         8086
+# Serial Number:               CVCQ72640068400AGN
+# Model Number:                INTEL SSDPEDMW400G4
+# Firmware Version:            8EV10171
+# Recommended Arb Burst:       0
+# IEEE OUI Identifier:         e4 d2 5c
+# Multi-Path I/O Capabilities: Not Supported
+# Max Data Transfer Size:      131072 bytes
+# Controller ID:               0x0000
+# Version:                     0.0.0
+sub load_nvmecontrol_identify {
+    foreach my $dev (@_) {
+	my $serial;
+	my $firmware;
+	
+	open(FH, "nvmecontrol identify $dev |");
+
+	while (<FH>) {
+	    chomp($_);
+
+	    if ($_ =~ /^Serial Number:\s+(\S+)$/) {
+		$serial = $1;
+	    } elsif ($_ =~ /^Firmware Version:\s+(\S+)$/) {
+		$firmware = $1;
+	    }
+	}
+
+	close(FH);
+
+	if (defined $serial and defined $firmware) {
+	    my $d = $drives_by_dev->{$dev};
+	    $d->{serial} = $serial;
+	    set_value($d, 'firmware', $firmware);
+#	    $d->{firmware} = $firmware;
+	    $drives_by_id->{$serial} = $d;
+	}
+    }
+}
+
+# root@filur00:/usr/home/Lpeter86 # nvmecontrol devlist
+#   nvme0: INTEL SSDPEDMW400G4
+#     nvme0ns1 (381554MB)
+sub load_nvmecontrol {
+    my @devlist;
+
+    open(FH, 'nvmecontrol devlist |');
+    while (<FH>) {
+	chomp($_);
+
+	
+	my $dev;
+	my $size;
+	
+	if ($_ =~ /^\s*([a-z]+\d+):\s+(\S+)\s+(\S+)$/) {
+	    $dev = $1;
+
+	    next if 0 < @sel_drives && !in_list($dev, @sel_drives);
+	    
+	    my $d = $drives_by_dev->{$dev};
+	    $d->{dev} = $dev;
+	    set_value($d, 'vendor', $2);
+	    set_value($d, 'model', $3);
+	    set_value($d, 'dsize', 0);
+	    set_value($d, 'type', 'NVMe');
+	    
+	    $drives_by_dev->{$d->{dev}} = $d;
+	    push @devlist, $d->{dev};
+	} elsif ($_ =~ /^\s+(nvme\d+)ns\d+\s\((\d+)MB\)/) {
+	    my $dev = $1;
+	    
+	    next if 0 < @sel_drives && !in_list($dev, @sel_drives);
+	    
+	    my $nsize = $2*1024*1024;
+
+	    my $d = $drives_by_dev->{$dev};
+	    $d->{dsize} += $nsize;
+	    $d->{size} = int2size($d->{dsize});
+	}
+    }
+    close(FH);
+
+    load_nvmecontrol_identify(@devlist);
+#    load_nvmecontrol_logpage(@devlist);
+}
+
+
+# camcontrol inquiry da0
+# pass0: <HP MB010000JWAYK HPD5> Fixed Direct Access SPC-4 SCSI device
+# pass0: Serial Number         7PH8L88G
+# pass0: 135.168MB/s transfers, Command Queueing Enabled
+
+sub load_camcontrol_inquiry {
+    foreach my $dev (@_) {
+	# Skip non-SCSI disks
+	my $d = $drives_by_dev->{$dev};
+	next if !defined $d or $d->{dev} !~ /^da/;
+	
+	open(FH, "camcontrol inquiry $dev |");
+	while (<FH>) {
+	    chomp($_);
+	    
+	    if ($_ =~ /^([^:]+):\s+Serial Number\s+(\S+)$/) {
+		my $serial = $2;
+		$d->{serial} = $serial;
+		$drives_by_id->{$serial} = $d;
+	    }
+	}
+	close(FH);
+    }
+}
+
+
+# camcontrol identify pass145
+# pass145: <MK000480GWCEV HPG3> ACS-3 ATA SATA 3.x device
+# pass145: 600.000MB/s transfers (SATA 3.x, UDMA6, PIO 8192bytes)
+# 
+# protocol              ACS-3 ATA SATA 3.x
+# device model          MK000480GWCEV
+# firmware revision     HPG3
+# serial number         S3EBNX0J631389
+# WWN                   5002538c4068c53c
+# additional product id         
+# cylinders             16383
+# heads                 16
+# sectors/track         63
+# sector size           logical 512, physical 512, offset 0
+# LBA supported         268435455 sectors
+# LBA48 supported       937703088 sectors
+# PIO supported         PIO4
+# DMA supported         WDMA2 UDMA6 
+# media RPM             non-rotating
+# Zoned-Device Commands no
+#...
+# SMART                          yes	yes
+
+sub load_camcontrol_identify {
+    foreach my $dev (@_) {
+	# Skip non-SATA disks
+	
+	my $d = $drives_by_dev->{$dev};
+	next if !defined $d or $d->{dev} !~ /^ada/;
+	
+	open(FH, "camcontrol identify $dev |");
+	while (<FH>) {
+	    chomp($_);
+	    
+	    if ($_ =~ /^serial number\s+(\S+)/) {
+		my $serial = $1;
+		$d->{serial} = $serial;
+		$drives_by_id->{$serial} = $d;
+	    }
+	}
+	close(FH);
+    }
+}
+
+# <ATA WDC WD2003FYYS-0 1D02>        at scbus0 target 0 lun 0 (pass0,da0)
+# <ATA WDC WD2003FYYS-0 1D01>        at scbus0 target 4 lun 0 (pass1,da1)
+# <ATA WDC WD2003FYYS-0 1D01>        at scbus0 target 5 lun 0 (pass2,da2)
+# <ATA WDC WD2003FYYS-0 1D02>        at scbus0 target 6 lun 0 (pass3,da3)
+# <ATA WDC WD2003FYYS-0 1D02>        at scbus0 target 7 lun 0 (pass4,da4)
+# <ATA SSDSC2BB960G7R DL42>          at scbus0 target 8 lun 0 (pass5,da5)
+# <ATA SSDSC2BB960G7R DL43>          at scbus0 target 9 lun 0 (pass6,da6)
+# <ATA WDC WD2003FYYS-0 1D02>        at scbus0 target 10 lun 0 (pass7,da7)
+# <TSSTcorp DVD+-RW TS-L633J D250>   at scbus3 target 0 lun 0 (cd0,pass8)
+# <iDRAC LCDRIVE 0323>               at scbus5 target 0 lun 0 (da8,pass9)
+# <iDRAC Virtual CD 0323>            at scbus6 target 0 lun 0 (pass10,cd1)
+
+sub load_camcontrol {
+    my @devlist;
+    
+    open(FH, 'camcontrol devlist |');
+    while (<FH>) {
+	chomp($_);
+
+	if ($_ =~/^<([^>]+)>\s+at ([a-z]+\d+) target (\d+) lun (\d+) \((pass\d+),([a-z]+\d+)/) {
+	    my $dev = $6;
+	    next if 0 < @sel_drives and !in_list($dev, @sel_drives);
+	    
+	    my $d = $drives_by_dev->{$dev};
+	    $d->{dev} = $dev;
+	    
+	    my $info = $1;
+	    set_value($d, 'bus', $2);
+	    set_value($d, 'target', $3);
+	    set_value($d, 'lun', $4);
+	    set_value($d, 'pass', $5);
+
+	    my $a = $smpphylist_by_dev->{$dev};
+	    
+	    if (defined $a) {
+		my $m = $mprs_by_addr->{$a->{addr}};
+		
+		if (defined $m) {
+		    set_value($d, 'ses_unit', $m->{unit}) unless defined $d->{ses_unit};
+		    set_value($d, 'bay', $m->{bay}) unless defined $d->{bay};
+		    set_value($d, 'type', $m->{type});
+		    set_value($d, 'speed', $m->{speed});
+		}
+	    }
+		
+	    if ($info =~ /^ATA\s+(\S+)\s+(\S+)\s+(\S+)$/) {
+		set_value($d, 'vendor', $1);
+		set_value($d, 'model', $2);
+		set_value($d, 'firmware', $3);
+	    } elsif ($info =~ /^(\S+)\s+(\S+)\s+(\S+)$/) {
+		set_value($d, 'vendor', $1);
+		set_value($d, 'model', $2);
+		set_value($d, 'firmware', $3);
+	    } elsif ($info =~ /^(\S+)\s+(\S+)$/) {
+		set_value($d, 'model', $1);
+		set_value($d, 'firmware', $2);
+	    }
+	    
+	    if ($dev =~ /^(da|ada)\d+$/) {
+		$drives_by_dev->{$dev} = $d;
+		push @devlist, $dev;
+	    }
+	}
+    }
+    close(FH);
+    
+    load_camcontrol_inquiry(@devlist);
+    load_camcontrol_identify(@devlist)
+}
+
+
+
+
+#  pool: FILUR06
+#  state: ONLINE
+#   scan: scrub repaired 0 in 0 days 23:49:13 with 0 errors on Sat Jan  7 21:49:40 2023
+# config:
+# 
+# 	NAME                      STATE     READ WRITE CKSUM
+# 	FILUR06                   ONLINE       0     0     0
+# 	  raidz2-0                ONLINE       0     0     0
+#	    diskid/DISK-5PGU35SF  ONLINE       0     0     0
+# 	    diskid/DISK-5PGTPRMC  ONLINE       0     0     0
+#...
+#    12610003708452241838      UNAVAIL      0     0     0  was /dev/diskid/DISK-7PH8L9SG
+#...
+#    diskid/DISK-7PH93X6G      DEGRADED     0     0     0  too many errors
+#
+#	spares
+#	  diskid/DISK-WBM4806R    AVAIL   
+#	  diskid/DISK-WBM47ZWJ    AVAIL   
+
+sub load_zpool_status {
+    my $zpool;
+    
+    open(FH, 'zpool status |');
+    while (<FH>) {
+	chomp($_);
+	
+	my $line = $_;
+	
+	if ($line =~ /^\s+pool:\s+(\S+)$/) {
+	    $zpool = $1;
+	} elsif ($line =~ /^\s+(\S+)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\d+.*)$/ or
+		 $line =~ /^\s+(\S+)\s+(AVAIL|INUSE)/) {
+	    my $disk = $1;
+	    my $serial;
+	    my $dev;
+	    
+	    my $zstatus = $2;
+	    my $zread = $3;
+	    my $zwrite = $4;
+	    my $zcksum = $5;
+	    my $zreason;
+
+	    if (defined $zcksum and $zcksum =~ /^(\d+)\s+(\S.*)$/) {
+		$zcksum = $1;
+		$zreason = $2;
+	    }
+	    
+	    if (defined $zreason and $zreason =~ /^was (\S+)$/) {
+		$disk = $1;
+	    }
+	    
+	    if ($disk =~ /^\/dev\/diskid\/DISK-(\S+)p\d+$/) {
+		$serial = $1;
+	    } elsif ($disk =~ /^\/dev\/diskid\/DISK-(\S+)$/) {
+		$serial = $1;
+	    } elsif ($disk =~ /^diskid\/DISK-(\S+)p\d+$/) {
+		$serial = $1;
+	    } elsif ($disk =~ /^diskid\/DISK-(\S+)$/) {
+		$serial = $1;
+	    } elsif ($disk =~ /^([a-z]+\d+)p\d+$/) {
+		$dev = $1;
+	    } elsif ($disk =~ /^([a-z]+\d+)$/) {
+		$dev = $1;
+	    } elsif ($disk =~ /^gpt\/(\S+)$/) {
+		$dev = $gpart_dev_by_name->{$1};
+		if (!defined $dev) {
+		    print STDERR "$disk: Invalid GPT label\n" if 0 == @sel_drives;
+		    next;
+		}
+	    } else {
+#		print STDERR "$disk: Invalid disk name\n";
+		next;
+	    }
+
+	    my $d;
+	    if (defined $serial) {
+		$d = $drives_by_id->{$serial};
+		$d->{serial} = $serial;
+		$dev = $d->{dev};
+	    } else {
+		$d = $drives_by_dev->{$dev};
+		if (!defined $d) {
+		    print STDERR ps($dev)." [".ps($serial)."]: Not found\n";
+		    next;
+		}
+		$d->{dev} = $dev;
+		$serial = $d->{serial};
+	    }
+
+	    set_value($d, 'users', 'zfs');
+	    set_value($d, 'where', $zpool);
+	    set_value($d, 'zstate', $zstatus);
+	    set_value($d, 'zread', $zread);
+	    set_value($d, 'zwrite', $zwrite);
+	    set_value($d, 'zcksum', $zcksum);
+
+	    $drives_by_id->{$serial} = $d if defined $serial;
+	    $drives_by_dev->{$dev} = $d if defined $dev;
+	}
+    }
+    close(FH);
+}
+    
+
+
+# smartctl -a --device=cciss,9 /dev/ciss0
+# smartctl 7.3 2022-02-28 r5338 [FreeBSD 12.3-RELEASE-p7 amd64] (local build)
+# Copyright (C) 2002-22, Bruce Allen, Christian Franke, www.smartmontools.org
+# 
+# === START OF INFORMATION SECTION ===
+# Vendor:               HPE
+# Product:              MB010000JWZHA
+# Revision:             HPD2
+# Compliance:           SPC-5
+# User Capacity:        10,000,831,348,736 bytes [10.0 TB]
+# Logical block size:   512 bytes
+# Physical block size:  4096 bytes
+# Sector Sizes:     512 bytes logical, 4096 bytes physical
+# Sector Size:      512 bytes logical/physical
+# Rotation Rate:        7200 rpm
+# Form Factor:          3.5 inches
+# Logical Unit id:      0x5000c500d81abde3
+# Serial number:        ZTN0JB5P
+# Device type:          disk
+# Transport protocol:   SAS (SPL-4)
+# Local Time is:        Mon Jan 23 22:14:01 2023 CET
+# SATA Version is:  SATA 3.2, 6.0 Gb/s (current: 6.0 Gb/s)
+# Compliance:           SPC-4
+# SMART support is:     Available - device has SMART capability.
+# SMART support is:     Enabled
+# Temperature Warning:  Enabled
+# 
+# === START OF READ SMART DATA SECTION ===
+# SMART Health Status: OK
+# 
+# Current Drive Temperature:     29 C
+# Drive Trip Temperature:        60 C
+
+sub load_smartctl_ciss {
+    my ($ciss, $did) = @_;
+
+    my $serial;
+    my $smart;
+    my $rpm;
+    my $temp;
+    my $type;
+    my $speed;
+    my $lbsize;
+    my $pbsize;
+    my $form;
+    
+    open(FH, "smartctl -a --device=cciss,$did $ciss |");
+    while (<FH>) {
+	chomp($_);
+
+	my $line = $_;
+	
+	if ($line =~ /^Serial number:\s+(\S+)/) {
+	    $serial = $1;
+	} elsif ($line =~ /^SMART Health Status:\s+(\S+)/) {
+	    $smart = $1;
+	} elsif ($line =~ /^Rotation Rate:\s+(\d+) rpm$/) {
+	    $rpm = $1;
+	} elsif ($line =~ /^Current Drive Temperature:\s+(\S.*)$/) {
+	    $temp = $1;
+	} elsif ($line =~ /^Sector Sizes:\s+(\d+) bytes logical, (\d+) bytes physical$/) {
+	    $lbsize = $1;
+	    $pbsize = $2;
+	} elsif ($line =~ /^Sector Size:\s+(\d+) bytes logical\/physical$/) {
+	    $lbsize = $1;
+	    $pbsize = $1;
+	} elsif ($line =~ /^Logical block size:\s+(\d+) bytes$/) {
+	    $lbsize = $1;
+	} elsif ($line =~ /^Physical block size:\s+(\d+) bytes$/) {
+	    $pbsize = $1;
+	} elsif ($line =~ /^Form Factor:\s+([\d\.]+) inches$/) {
+	    $form = "$1\"";
+	} elsif ($line =~ /^SATA Version is:\s+(\S+) ([\d\.]+),\s+([\d\.]+) G/) {
+	    $type = $1;
+	    $speed = $3;
+	} elsif ($line =~ /^Compliance:\s+SPC/) {
+	    $type = 'SCSI';
+	} elsif ($line =~ /^Transport protocol:\s+(\S+)/) {
+	    $type = $1;
+	}
+    }
+    close(FH);
+
+    return unless defined $serial;
+    
+    my $d = $drives_by_id->{$serial};
+    $smart = 'OK' if defined $smart and $smart eq 'PASSED';
+    set_value($d, 'smart', $smart);
+    set_value($d, 'rpm', $rpm);
+    set_value($d, 'temp', $temp);
+    set_value($d, 'type', $type);
+    set_value($d, 'speed', $speed);
+    set_value($d, 'lbsize', $lbsize);
+    set_value($d, 'pbsize', $pbsize);
+    set_value($d, 'form', $form);
+}
+
+
+
+
+sub int2size {
+    my $n = shift;
+
+    return unless defined $n;
+    return $n if $n < 1000;
+
+    $n /= 1000.0;
+    return sprintf "%dK", 0.5+$n if $n < 1000;
+    
+    $n /= 1000.0;
+    return sprintf "%dM", 0.5+$n if $n < 1000;
+    
+    $n /= 1000.0;
+    return sprintf "%dG", 0.5+$n if $n < 1000;
+    
+    $n /= 1000.0;
+    return sprintf "%dT", 0.5+$n;
+}
+
+# smartctl -a /dev/pass145
+# smartctl 7.3 2022-02-28 r5338 [FreeBSD 12.3-RELEASE-p7 amd64] (local build)
+# Copyright (C) 2002-22, Bruce Allen, Christian Franke, www.smartmontools.org
+# 
+# === START OF INFORMATION SECTION ===
+# Device Model:     MK000480GWCEV
+# Serial Number:    S3EBNX0J631389
+# LU WWN Device Id: 5 002538 c4068c53c
+# Firmware Version: HPG3
+# User Capacity:    480,103,981,056 bytes [480 GB]
+# User Capacity:    2 000 398 934 016 bytes [2,00 TB]
+# Sector Size:      512 bytes logical/physical
+# Rotation Rate:    Solid State Device
+# Form Factor:      2.5 inches
+# TRIM Command:     Available, deterministic, zeroed
+# Device is:        Not in smartctl database 7.3/5319
+# ATA Version is:   ACS-3 T13/2161-D revision 5
+# SATA Version is:  SATA 3.2, 6.0 Gb/s (current: 6.0 Gb/s)
+# Compliance:           SPC-4
+# Local Time is:    Mon Jan 23 23:27:56 2023 CET
+# SMART support is: Available - device has SMART capability.
+# SMART support is: Enabled
+# Current Drive Temperature:     24 C
+# SMART overall-health self-assessment test result: PASSED
+# 194 Temperature_Celsius     0x0022   126   095   000    Old_age   Always       -       26
+# 194 Temperature_Celsius     0x0022   078   059   000    Old_age   Always       -       22 (Min/Max 13/41)
+# 194 Temperature_Internal    0x0022   100   100   000    Old_age   Always       -       31
+# Temperature:                        21 Celsius
+
+sub load_smartctl_disk {
+    my ($dev) = @_;
+
+    my $serial;
+    my $size;
+    my $rpm;
+    my $sector_size;
+    my $temp;
+    my $smart;
+    my $type;
+    my $speed;
+    my $lbsize;
+    my $pbsize;
+    my $form;
+    
+    open(FH, "smartctl -a /dev/$dev |");
+    while (<FH>) {
+	chomp($_);
+
+	my $line = $_;
+
+	if ($line =~ /^Serial Number:\s+(\S+)/) {
+	    $serial = $1;
+	} elsif ($line =~ /^Serial number:\s+(\S+)/) {
+	    $serial = $1;
+	} elsif ($line =~ /^SMART overall-health self-assessment test result:\s+(\S+)/) {
+	    $smart = $1;
+	} elsif ($line =~ /^SMART Health Status:\s+(\S+)/) {
+	    $smart = $1;
+	} elsif ($line =~ /^User Capacity:\s+([\d,_]+) bytes/) {
+	    $size = $1;
+	    $size =~ tr/[,]//d;
+	    $size = int2size($size);
+	} elsif ($line =~ /^Rotation Rate:\s+(\d+) rpm$/) {
+	    $rpm = $1;
+	} elsif ($line =~ /^Current Drive Temperature:\s+(\S.*)$/) {
+	    $temp = $1;
+	} elsif ($line =~ /^Logical block size:\s+(\d+) bytes$/) {
+	    $lbsize = $1;
+	} elsif ($line =~ /^Physical block size:\s+(\d+) bytes$/) {
+	    $pbsize = $1;
+	} elsif ($line =~ /^Sector Size:\s+(\d+) bytes/) {
+	    $lbsize = $pbsize = $1;
+	} elsif ($line =~ /^Sector Sizes:\s+(\d+) bytes logical, (\d+) bytes physical$/) {
+	    $lbsize = $1;
+	    $pbsize = $2;
+	} elsif ($line =~ /^Form Factor:\s+([\d\.]+) inches$/) {
+	    $form = "$1\"";
+	} elsif ($line =~ /^SATA Version is:\s+(\S+) ([\d\.]+),\s+([\d\.]+) G/) {
+	    $type = $1;
+	    $speed = $3;
+	} elsif ($line =~ /^Compliance:\s+SPC/) {
+	    $type = 'SCSI';
+	} elsif ($line =~ /^Transport protocol:\s+(\S+)/) {
+	    $type = $1;
+	} elsif ($line =~ /^Temperature:\s+(\d+ C)/) {
+	    $temp = $1;
+	} elsif ($line =~ /^194\s+Temperature_Celsius\s+\S+\s+\d+\s+\d+\s+\d+\s+\S+\s+\S+\s+\S+\s+(\d+)/) {
+	    $temp = "$1 C";
+	} elsif ($line =~ /^194\s+Temperature_Internal\s+\S+\s+\d+\s+\d+\s+\d+\s+\S+\s+\S+\s+\S+\s+(\d+)/) {
+	    $temp = "$1 C";
+	}
+	
+    }
+    close(FH);
+
+    return unless defined $serial;
+    
+    my $d = $drives_by_id->{$serial};
+    set_value($d, 'size', $size);
+    set_value($d, 'sector_size', $sector_size);
+    set_value($d, 'temp', $temp);
+    set_value($d, 'rpm', $rpm);
+    $smart = 'OK' if defined $smart and $smart eq 'PASSED';
+    set_value($d, 'smart', $smart);
+    set_value($d, 'type', $type);
+    set_value($d, 'speed', $speed);
+    set_value($d, 'lbsize', $lbsize);
+    set_value($d, 'pbsize', $pbsize);
+    set_value($d, 'form', $form);
+}
+
+
+# Controller: Smart HBA H241
+#   Board ID: 0x21c8103c
+#   Logical drives: 0
+#   Running firmware: 7.00
+#   ROM firmware: 7.00
+#   Physical drives: 69
+#          connector 1E box 1 bay 1                  HP      MB012000JWDFD                                    5PGU16DC     HPD2 OK
+#          connector 1E box 1 bay 2                  HP      MB012000JWDFD                                    5PGU1VHC     HPD2 OK
+#          connector 1E box 1 bay 3                  HP      MB012000JWDFD                                    5PGTTNPC     HPD2 OK
+#          connector 2E box 1 bay 8                 HP      DF300BB6C3                           3LM08AP700009713RXUT     HPD3 S.M.A.R.T. predictive failure.
+
+sub load_cciss_vol_status {
+    my $nciss = 0;
+    
+    while (-e "/dev/ciss${nciss}") {
+	my $dev = "/dev/ciss${nciss}";
+
+	my $ndrives;
+	my @didlist;
+	my $nd = 0;
+	
+	open(FH, "cciss_vol_status -V $dev |");
+	while (<FH>) {
+	    chomp($_);
+
+	    if ($_ =~ /^\s+Physical drives:\s+(\d+)/) {
+		$ndrives = $1;
+	    } elsif ($_ =~ /^\s+connector\s+(\S+)\s+box\s+(\d+)\s+bay\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S.*)$/) {
+		my $serial = $6;
+		my $d = $drives_by_id->{$serial};
+		if (!defined $d) {
+		    print STDERR "$serial: Drive not found\n" if 0 == @sel_drives;
+		    next;
+		}
+		$d->{connector} = $1;
+		$d->{box} = $2;
+		$d->{bay} = $3;
+		$d->{vendor} = $4;
+		$d->{model} = $5;
+		$d->{firmware} = $7;
+		$d->{ciss} = $8;
+		$d->{cissdev} = $dev;
+
+		push @didlist, $nd if 0 == @sel_drives or (defined $dev and in_list($dev, @sel_drives));
+		$nd++;
+	    }
+	}
+	close(FH);
+
+	foreach my $did (@didlist) {
+	    load_smartctl_ciss($dev, $did);
+	}
+
+	$nciss++;
+    }
+}
+
+
+# zroot/ROOT/default on / (zfs, local, noatime, nfsv4acls)
+# devfs on /dev (devfs, local, multilabel)
+# fdescfs on /dev/fd (fdescfs)
+# procfs on /proc (procfs, local, read-only)
+# zroot on /zroot (zfs, local, noatime, nfsv4acls)
+# zroot/iocage on /iocage (zfs, local, noatime, nfsv4acls)
+# zroot/iocage/download on /iocage/download (zfs, local, noatime, nfs
+# /dev/da0p0 on /test (ufs, local)
+# /dev/mirror/gm0s1a on /mnt (ufs, local, soft-updates)
+
+sub load_mount {
+    open(FH, "mount |");
+    while (<FH>) {
+	chomp($_);
+
+	my @devlist;
+	my $fs;
+	my $mpt;
+	
+	if ($_ =~ /^\/dev\/(mirror\/\S+)\son\s+(\S.*)\s+\(([^,]+),/) {
+	    my $mname = $1;
+	    $mpt = $2;
+	    $fs = $3;
+	    
+	    my $dname = $mname;
+	    
+	    while (my $tmp = $gpart_name_by_dev->{$dname}) {
+		$dname = $tmp;
+	    }
+
+	    while (my $m = $gmirror_by_provider->{$dname}) {
+		$dname = $m->{dname};
+	    }
+
+	    push @devlist, split(/,/, $dname);
+	} elsif ($_ =~ /^\/dev\/gpt\/(\S+)\s+on\s+(\S.*)\s+\(([^,]+),/) {
+	    $mpt = $2;
+	    $fs = $3;
+	    my $dev = $gpart_dev_by_name->{$1};
+	    push @devlist, $dev;
+	} elsif ($_ =~ /^\/dev\/(\S+)\s+on\s+(\S.*)\s+\(([^,]+),/) {
+	    $mpt = $2;
+	    $fs = $3;
+	    my $dev = $1;
+	    push @devlist, $dev;
+	}
+
+	if (0 < @devlist) {
+	    foreach my $dev (@devlist) {
+		next if 0 < @sel_drives and (!defined $dev or !in_list($dev, @sel_drives));
+		
+		my $d = $drives_by_dev->{$dev};
+
+		set_value($d, 'users', $fs);
+		set_value($d, 'where', $mpt);
+		$drives_by_dev->{$dev} = $d;
+	    }
+	}
+    }
+    close(FH);
+}
+
+sub ps {
+    my @res;
+
+    foreach my $s (@_) {
+	push @res, "$s" if defined $s;
+    }
+
+    return join(' ', @res) if 0 < @res;
+    return "-";
+}
+
+
+my $pfmt_very_verbose = "%7s %-7s %-15s %-23s %-15s %-23s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-15s %-15s %-7s %-7s %-7s %s";
+my $pfmt_verbose = "%7s %-7s %-15s %-23s %-15s %-23s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-15s %-15s %-7s %-7s %-7s %s";
+my $pfmt_default = "%7s %-7s %-15s %-23s %-15s %-23s %-7s %-7s %-7s %-7s %-7s %-15s %-15s %s";
+
+sub print_head {
+    return unless $f_header;
+    print "[1;4m" if -t STDOUT;
+    if ($f_verbose > 1) {
+	printf $pfmt_very_verbose, "#", "Dev", "Vendor", "Model", "Firmware", "Serial", "Size", "Temp", "RPM", "Type", "Speed", "Form", "Sector", "Smart", "Bay", "CISS", "SES", "Bus", "Target", "LUN", "Users", "Where", "ZState", "ZRead", "ZWrite", "Cksum", "Reason";
+    } elsif ($f_verbose) {
+	printf $pfmt_verbose, "#", "Dev", "Vendor", "Model", "Firmware", "Serial", "Size", "Temp", "RPM", "Type", "Speed", "Smart", "Bay", "CISS", "SES", "Users", "Where", "ZState", "ZRead", "ZWrite", "Cksum", "Reason";
+    } else {
+	printf $pfmt_default, "#", "Dev", "Vendor", "Model", "Firmware", "Serial", "Size", "Temp", "Smart", "Bay", "Users", "Where", "ZState", "Reason";
+    }
+    print "[0m" if -t STDOUT;
+    print "\n";
+}
+
+
+sub _cmp_drive {
+    $f_sort = 'dev' unless defined $f_sort;
+
+    my $an = $drives_by_id->{$a}->{$f_sort};
+    my $bn = $drives_by_id->{$b}->{$f_sort};
+    
+    if ($f_sort eq 'dev') {
+	my $anum;
+	my $bnum;
+	
+	return  1 if !defined $an and  defined $bn;
+	return -1 if  defined $an and !defined $bn;
+	return $a cmp $b if !defined $an and !defined $bn;
+	
+	if ($an =~ /^(.*[^\d])(\d+)$/) {
+	    $an = $1;
+	    $anum = $2;
+	}
+	if ($bn =~ /^(.*[^\d])(\d+)$/) {
+	    $bn = $1;
+	    $bnum = $2;
+	}
+	
+	my $n = $an cmp $bn;
+	return $n if $n;
+	
+	return  1 if !defined $anum and  defined $bnum;
+	return -1 if  defined $anum and !defined $bnum;
+	return $anum <=> $bnum;
+	
+    } elsif ($f_sort eq 'bay') {
+	my $au = $drives_by_id->{$a}->{ses_unit};
+	my $bu = $drives_by_id->{$b}->{ses_unit};
+	
+	return  1 if !defined $au and  defined $bu;
+	return -1 if  defined $au and !defined $bu;
+	
+	if (defined $au and defined $bu) {
+	    my $n = ($au <=> $bu);
+	    return $n if $n;
+	}
+	
+	return  1 if !defined $an and  defined $bn;
+	return -1 if  defined $an and !defined $bn;
+	return $a cmp $b if !defined $an and !defined $bn;
+	
+	return $an <=> $bn;
+	
+    } else {
+	return  1 if !defined $an and  defined $bn;
+	return -1 if  defined $an and !defined $bn;
+	return $a cmp $b if !defined $an and !defined $bn;
+	
+	return $an cmp $bn;
+    }
+}
+
+sub cmp_drive {
+    my $n = _cmp_drive($a, $b);
+
+    print "CMP_DRIVE: A=$a (AU=$drives_by_id->{$a}->{ses_unit}, AN=$drives_by_id->{$a}->{bay}) B=$b (BU=$drives_by_id->{$b}->{ses_unit}, BN=$drives_by_id->{$b}->{bay})-> $n\n" if $f_debug;
+    return $n;
+}
+
+
+
+my $n = 0;
+
+sub print_disk {
+    my $d = shift;
+
+    $n++;
+
+    my $ses_bay;
+    if (defined $d->{ses_unit}) {
+	$ses_bay = $d->{ses_unit}.":".$d->{bay};
+    } else {
+	$ses_bay = $d->{bay};
+    }
+
+    if ($f_verbose > 1) {
+	my $sector;
+
+	if (defined $d->{pbsize}) {
+	    $sector = int2size($d->{pbsize});
+	    $sector .= '/'.int2size($d->{lbsize}) if defined $d->{lbsize} and $d->{pbsize} ne $d->{pbsize};
+	} elsif (defined $d->{lbsize}) {
+	    $sector = int2size($d->{lbsize});
+	}
+	printf $pfmt_very_verbose,
+	    $n,
+	    ps($d->{dev}),
+	    ps($d->{vendor}),
+	    ps($d->{model}),
+	    ps($d->{firmware}),
+	    ps($d->{serial}),
+	    ps($d->{size}),
+	    ps($d->{temp}),
+	    ps($d->{rpm}),
+	    ps($d->{type}),
+	    ps($d->{speed}),
+	    ps($d->{form}),
+	    ps($sector),
+	    ps($d->{smart}),
+	    ps($ses_bay),
+	    ps($d->{ciss}),
+	    ps($d->{ses_info}),
+	    ps($d->{bus}),
+	    ps($d->{target}),
+	    ps($d->{lun}),
+	    ps($d->{users}),
+	    ps($d->{where}),
+	    ps($d->{zstate}),
+	    ps($d->{zread}),
+	    ps($d->{zwrite}),
+	    ps($d->{zcksum}),
+	    ps($d->{zreason});
+    } elsif ($f_verbose) {
+	printf $pfmt_verbose,
+	    $n,
+	    ps($d->{dev}),
+	    ps($d->{vendor}),
+	    ps($d->{model}),
+	    ps($d->{firmware}),
+	    ps($d->{serial}),
+	    ps($d->{size}),
+	    ps($d->{temp}),
+	    ps($d->{rpm}),
+	    ps($d->{type}),
+	    ps($d->{speed}),
+	    ps($d->{smart}),
+	    ps($ses_bay),
+	    ps($d->{ciss}),
+	    ps($d->{ses_info}),
+	    ps($d->{users}),
+	    ps($d->{where}),
+	    ps($d->{zstate}),
+	    ps($d->{zread}),
+	    ps($d->{zwrite}),
+	    ps($d->{zcksum}),
+	    ps($d->{zreason});
+    } else {
+	printf $pfmt_default,
+	    $n,
+	    ps($d->{dev}),
+	    ps($d->{vendor}),
+	    ps($d->{model}),
+	    ps($d->{firmware}),
+	    ps($d->{serial}),
+	    ps($d->{size}),
+	    ps($d->{temp}),
+	    ps($d->{smart}),
+	    ps($ses_bay),
+	    ps($d->{users}),
+	    ps($d->{where}),
+	    ps($d->{zstate}),
+	    ps($d->{zreason});
+    }
+    print "\n";
+}
+
+
+
+load_sesutil_show();
+
+load_mprsutil('mprutil');
+load_mprsutil('mpsutil');
+load_camcontrol_smpphylist(@seslist);
+    
+load_gmirror_list();
+load_gpart_list();
+load_nvmecontrol();
+load_camcontrol();
+load_mount();
+
+load_zpool_status();
+load_cciss_vol_status();
+
+foreach my $id (keys %$drives_by_id) {
+    my $d = $drives_by_id->{$id};
+    next if defined $d->{cissdev};
+
+    next unless defined $d->{dev};
+    
+    my $dev = $d->{dev};
+    next if 0 < @sel_drives and (!defined $dev or !in_list($dev, @sel_drives));
+    load_smartctl_disk($dev);
+}
+
+print_head();
+
+$n = 0;
+
+if ($f_view eq 'empty') {
+    foreach my $d (@empty_drive_bays) {
+	print_disk($d);
+    }
+} else {
+    foreach my $id (sort cmp_drive keys %$drives_by_id) {
+	my $d = $drives_by_id->{$id};
+	
+	my $dev = $d->{dev};
+	next if 0 < @sel_drives and (!defined $dev or !in_list($dev, @sel_drives));
+	
+	if ($f_view eq 'unallocated') {
+	    if (defined $d->{dev} and !defined $d->{zpool}) {
+		print_disk($d);
+	    }
+	    
+	} elsif ($f_view eq 'problems') {
+	    if ((defined $d->{smart} and !($d->{smart} eq 'OK' or $d->{smart} eq 'PASSED')) or
+		(defined $d->{zstate} && $d->{zstate} ne 'ONLINE') or
+		(defined $d->{zread} && $d->{zread} > 0) or
+		(defined $d->{zwrite} && $d->{zwrite} > 0) or
+		(defined $d->{zcksum} && $d->{zcksum} > 0) or 
+		(defined $d->{ciss} && $d->{ciss} ne 'OK')) {
+		print_disk($d);
+	    }
+	    
+	} elsif ($f_view eq 'all') {
+	    print_disk($d);
+	} else {
+	    # Skip empty bays but print failed zpool disks
+	    
+	    next unless defined $d->{serial};
+	    print_disk($d);
+	}
+    }
+}
+
+exit 0;

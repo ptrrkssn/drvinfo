@@ -1,0 +1,48 @@
+# drvinfo
+
+A perl script that summarizes drive usage & information on FreeBSD systems
+
+Can be used to get an overview of disk status (SMART, zfs/zpool usage,
+filesystems, temperatures, sizes, sectors sizes, models, serial numbers,
+devices, enclosure slots and more... If you have many disks then this can
+be handy to identify "forgotten" drives for example (find disks that aren't
+used in any ZFS pools for example).
+
+Run as "drvinfo -h" for usage information.
+
+
+AUTHOR
+
+Peter Eriksson <pen@lysator.liu.se>
+
+
+
+REQUIREMENTS
+
+- FreeBSD
+- root access
+- perl
+- smartctl
+- sesutil (for mapping storage enclosures)
+- mprutil (if using LSI HBA/RAID controllers)
+- mpsutil (if using LSI HBA/RAID controllers)
+- nvmecontrola (for NVME drives)
+- cciss_vol_status (if using HP CISS RAID/HBA controllers)
+
+
+SAMPLE OUTPUT
+
+# /tmp/drvinfo
+      # Dev     Vendor          Model                   Firmware        Serial                  Size    Temp    Smart   Bay     Users   Where           ZState          Reason
+      1 da0     HGST            HUH721010AL4200         LS21            7PJSZTNC                10T     24 C    OK      0:0     zfs     DATA            ONLINE          -
+      2 da1     HGST            HUH721010AL4200         LS21            7PK8G64C                10T     23 C    OK      0:1     zfs     DATA            ONLINE          -
+      3 da2     HGST            HUH721010AL4200         LS21            7PK8J0GG                10T     23 C    OK      0:2     zfs     DATA            ONLINE          -
+      4 da3     HGST            HUH721010AL4200         LS21            7PK6X38C                10T     24 C    OK      0:3     zfs     DATA            ONLINE          -
+      5 da4     TOSHIBA         KPM5XMUG400G            B026            X9P0A0L2TP9F            400G    26 C    OK      0:4     -       -               -               -
+      6 da5     TOSHIBA         KPM5XVUG960G            B026            Z9Q0A0DXTP5F            960G    27 C    OK      0:5     -       -               -               -
+      7 da6     ATA             SSDSC2BB120G7R          DL43            PHDV7136030C150MGN      120G    25 C    OK      0:12    zfs     zroot           ONLINE          -
+      8 da7     ATA             SSDSC2BB120G7R          DL43            PHDV7136024R150MGN      120G    27 C    OK      0:13    zfs     zroot           ONLINE          -
+      9 da8     ATA             SSDSC2BB120G7R          DL43            PHDV70620AY9150MGN      120G    25 C    OK      0:14    zfs     TEMP            ONLINE          -
+     10 da9     ATA             SSDSC2BB120G7R          DL43            PHDV70620B25150MGN      120G    24 C    OK      0:15    zfs     DATA            ONLINE          -
+     11 nvme0   INTEL           SSDPEDMW400G4           8EV10171        CVCQ72640068400AGN      400G    21 C    OK      -       zfs     DATA            ONLINE          -
+
